@@ -65,9 +65,9 @@ def analyze_instrument(
     res.last_price = price
     res.last_close = last_close
 
-    closes = [c.close for c in candles]
     require_div = bool(chan_cfg.get("requireBuy1Divergence", False))
     if require_div:
+        closes = [c.close for c in candles]
         dif, dea, hist = macd(
             closes,
             chan_cfg.get("macdFast", 12),
@@ -75,8 +75,8 @@ def analyze_instrument(
             chan_cfg.get("macdSignal", 9),
         )
     else:
-        # 背驰开关关闭时跳过 MACD 全量计算（detect 内直接视为通过）
-        dif, dea, hist = [], [], [0.0] * n
+        # 背驰开关关闭时跳过 closes 物化 + MACD 全量计算（detect 内直接视为通过）
+        dif, dea, hist = [], [], []
     atr_arr = atr_indicator(candles, int(chan_cfg.get("atrPeriod", 14)))
 
     ms = merge_bars(candles)

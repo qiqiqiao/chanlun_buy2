@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from .model import AnalysisResult, Stage, StructureStatus
 
 HOUR_MS = 3600000
@@ -39,11 +41,18 @@ def _qualifies(res: AnalysisResult, mode: str, cfg: dict) -> tuple[bool, str]:
         if mode == "enter"
         else float(pool.get("exitDistanceAtr", 2.0))
     )
-    if res.distance_atr != res.distance_atr:
+    if res.distance_atr is None or math.isnan(res.distance_atr):
         return False, "dist"
     if res.distance_atr > dist_line:
         return False, "dist"
     return True, ""
+
+
+def _remove_reason(res: AnalysisResult, cfg: dict) -> str:
+    """_qualifies 返回空 code 时的兜底（历史上不存在该路径，防御未来改动）。"""
+    if not res.ok or res.event is None:
+        return "no_signal"
+    return "removed"
 
 
 def _tier_bonus(res: AnalysisResult, table: dict) -> float:
@@ -115,9 +124,16 @@ def plan_pool(
 
     active = [c for c in cands if c.is_member or c.wait_reason == "eligible"]
 
+    # tier 加成与 final_score 在本轮内不变，预计算一次，两次排序复用；
+    # key 只剩一次字典查找 + 成员加成，避免比较期重复计算。
+    base_score = {id(c): c.res.final_score + _tier_bonus(c.res, tier_table) for c in cands}
+
+    def _key(c: Candidate) -> float:
+        return base_score[id(c)] + (mem_bonus if c.is_member else 0.0)
+
     selected: list[Candidate] = []
     used_bases: set[str] = set()
-    for c in sorted(active, key=lambda x: _sort_key(x, mem_bonus, tier_table), reverse=True):
+    for c in sorted(active, key=_key, reverse=True):
         if per_base_mode == "best" and c.res.base in used_bases:
             continue
         selected.append(c)
@@ -144,7 +160,7 @@ def plan_pool(
             elif res.ok and res.event is not None and c.wait_reason == "eligible":
                 res.stage = Stage.CANDIDATE
 
-    ordered = sorted(cands, key=lambda x: _sort_key(x, mem_bonus, tier_table), reverse=True)
+    ordered = sorted(cands, key=_key, reverse=True)
     for i, c in enumerate(ordered):
         c.rank = i + 1
 

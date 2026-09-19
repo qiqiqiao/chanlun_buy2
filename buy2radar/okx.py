@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import http.client
 import json
 import random
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 from .model import Candle
 
 BASE_URL = "https://www.okx.com"
+OKX_HOST = "www.okx.com"
 
 
 def parse_candle_row(row: list) -> Candle:
@@ -54,6 +54,10 @@ class OkxClient:
         self._timeout = float(self.cfg.get("timeoutSec", 20))
         self._lock = threading.Lock()
         self._last_ts = 0.0
+        # 线程本地长连接：同一线程复用一条 HTTPS 连接，避免每次
+        # urlopen 重建 TCP+TLS（首轮 500 币 ~1000 请求的主要开销）。
+        # http.client 连接非线程安全，故按线程隔离而非全局共享。
+        self._local = threading.local()
         if logger is not None:
             self._log = logger
         else:
@@ -75,22 +79,56 @@ class OkxClient:
         base = min(cap, (0.5 if rate_limited else 0.3) * (2**attempt))
         time.sleep(base + random.uniform(0.0, base * 0.5))
 
+    def _get_conn(self) -> http.client.HTTPSConnection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = http.client.HTTPSConnection(OKX_HOST, timeout=self._timeout)
+            self._local.conn = conn
+        return conn
+
+    def _drop_conn(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            self._local.conn = None
+
     def get(self, path: str, params: dict | None = None) -> list:
         query = ""
         if params:
             query = "?" + urllib.parse.urlencode(
                 {k: str(v) for k, v in params.items() if v is not None}
             )
+        full_path = path + query
         url = BASE_URL + path + query
         last_err: Exception | None = None
         for attempt in range(self._retries + 1):
             self._throttle()
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "buy2radar/1.0"}
-            )
             try:
-                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                    raw = resp.read().decode("utf-8")
+                conn = self._get_conn()
+                conn.request(
+                    "GET", full_path, headers={"User-Agent": "buy2radar/1.0"}
+                )
+                resp = conn.getresponse()
+                raw = resp.read().decode("utf-8")
+                if resp.status == 429:
+                    last_err = _RateLimit("429", "http too many requests")
+                    try:
+                        ra = resp.getheader("Retry-After")
+                        if ra is not None:
+                            time.sleep(min(30.0, float(ra)))
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                    self._backoff(attempt, rate_limited=True)
+                    continue
+                if resp.status != 200:
+                    last_err = OkxError(f"http status={resp.status}")
+                    self._drop_conn()
+                    self._backoff(attempt, rate_limited=False)
+                    continue
                 data = json.loads(raw)
                 if data.get("code") != "0":
                     code = str(data.get("code"))
@@ -98,38 +136,23 @@ class OkxClient:
                         raise _RateLimit(code, str(data.get("msg")))
                     raise OkxError(f"code={code} msg={data.get('msg')}")
                 return data.get("data", [])
-            except urllib.error.HTTPError as e:
-                last_err = e
-                if e.code == 429:
-                    # 优先尊重服务端的 Retry-After（秒）
-                    try:
-                        ra = e.headers.get("Retry-After") if e.headers else None
-                        if ra is not None:
-                            time.sleep(min(30.0, float(ra)))
-                            continue
-                    except (TypeError, ValueError):
-                        pass
-                    self._backoff(attempt, rate_limited=True)
-                else:
-                    self._backoff(attempt, rate_limited=False)
             except _RateLimit as e:
                 last_err = e
                 self._backoff(attempt, rate_limited=True)
-            except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+            except (http.client.HTTPException, OSError, json.JSONDecodeError) as e:
                 last_err = e
+                self._drop_conn()
                 self._backoff(attempt, rate_limited=False)
+            except OkxError:
+                raise
         hint = ""
-        if isinstance(last_err, urllib.error.URLError) and isinstance(
-            last_err.reason, OSError
-        ):
+        if isinstance(last_err, OSError):
             import errno
 
-            code = last_err.reason.errno
+            code = getattr(last_err, "errno", None)
             if code in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED):
                 hint = "；本机网络不可达，检查外网/代理/防火墙"
-            elif getattr(last_err.reason, "strerror", "") and "Name or service" in str(
-                last_err.reason
-            ):
+            elif "Name or service" in str(last_err):
                 hint = "；DNS 解析失败，当前环境可能无外网访问（沙箱/容器常见）"
         raise OkxError(f"GET failed {url} : {last_err}{hint}")
 

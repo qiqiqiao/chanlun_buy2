@@ -161,7 +161,7 @@ class ScanEngine:
             after = oldest
         return sorted(collected.values(), key=lambda x: x.ts)
 
-    def _remember(self, ins: Instrument, closed: list) -> bool:
+    def _remember(self, ins: Instrument) -> bool:
         today_start = day_start_ms()
         lim = self._history_bars
         candles = self.store.load_candles(
@@ -200,14 +200,15 @@ class ScanEngine:
             [(ins.inst_id, self._instrument_info(ins))],
             keep=self._candle_keep,
         )
-        return self._remember(ins, closed)
+        return self._remember(ins)
 
     def sync_all(self) -> None:
         ins = self.universe
         workers = max(1, int(self.cfg["data"].get("threads", 8)))
         log.info("syncing candles for %d instruments (workers=%d)", len(ins), workers)
         by_id = {it.inst_id: it for it in ins}
-        haves = {it.inst_id: self.store.latest_ts(it.inst_id, self._bar) for it in ins}
+        latest = self.store.latest_map([it.inst_id for it in ins], self._bar)
+        haves = {it.inst_id: latest.get(it.inst_id, 0) for it in ins}
         fetched: dict[str, list] = {}
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {
@@ -227,16 +228,23 @@ class ScanEngine:
                 continue
             if haves[inst_id] == 0 and len(closed) < self._min_candles:
                 continue
-            bundle[inst_id] = self._db_rows(closed)
             infos.append((inst_id, self._instrument_info(by_id[inst_id])))
+            rows = self._db_rows(closed)
+            have = haves[inst_id]
+            if have > 0 and rows:
+                # 增量过滤：DB 已有区间重复 upsert 是纯浪费（稳态每轮 500×320
+                # 行 INSERT OR IGNORE），只保留真正的新 K。
+                rows = [r for r in rows if r[0] > have]
+            if rows:
+                bundle[inst_id] = rows
         if bundle or infos:
             # 全批一次提交：500币×(upsert+prune+instrument)合并为一个事务
             self.store.apply_sync_bundle(
                 bundle, self._bar, infos, keep=self._candle_keep
             )
         ok_n = 0
-        for inst_id in bundle:
-            if self._remember(by_id[inst_id], fetched[inst_id]):
+        for inst_id, _info in infos:
+            if self._remember(by_id[inst_id]):
                 ok_n += 1
         log.info("candle sync done: %d/%d ok", ok_n, len(ins))
 

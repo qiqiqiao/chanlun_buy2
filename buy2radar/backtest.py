@@ -12,6 +12,19 @@ from .indicators import turnover_24h_at
 log = logging.getLogger("backtest")
 
 
+def _candles_to_raw(candles) -> list[tuple]:
+    """Candle 对象 → 轻量 tuple，进程池 pickle 体积减半（仅回测传输用）。"""
+    return [
+        (c.ts, c.open, c.high, c.low, c.close, c.vol, c.vol_ccy) for c in candles
+    ]
+
+
+def _candles_from_raw(raw: list[tuple]):
+    from .model import Candle
+
+    return [Candle(ts=t, open=o, high=h, low=l, close=c, vol=v, vol_ccy=q) for t, o, h, l, c, v, q in raw]
+
+
 def _walk_instrument(job: dict) -> tuple[list[dict], int, list[dict]]:
     """单币 walk-forward（顶层函数，供进程池 pickle）。
 
@@ -20,7 +33,13 @@ def _walk_instrument(job: dict) -> tuple[list[dict], int, list[dict]]:
     """
     from .model import InstType
 
-    candles = job["candles"]
+    raw = job.get("candles")
+    if raw is None:
+        raw = job.get("candles_raw")
+    if raw and isinstance(raw[0], (list, tuple)) and not hasattr(raw[0], "close"):
+        candles = _candles_from_raw(raw)
+    else:
+        candles = raw
     cfg = job["cfg"]
     fwd_days = job["fwd_days"]
     warmup = job["warmup"]
@@ -133,7 +152,7 @@ def run_backtest(cfg: dict, args) -> int:
         metas[ins.inst_id] = {"inst_type": ins.inst_type.value, "base": ins.base}
         jobs.append(
             {
-                "candles": candles,
+                "candles_raw": _candles_to_raw(candles),
                 "cfg": cfg,
                 "fwd_days": fwd_days,
                 "warmup": warmup,
@@ -378,27 +397,38 @@ def _report(events, fwd_days, min_score_grid, dist_grid):
         + " | ".join(f"K{d:<4}  n    mean  wr%   pf   mfe   mae" for d in fwd_days)
     )
     print("-" * 120)
+    # 预计算每笔信号各 K 的 fwd/mfe/mae：原实现每个网格单元重复扫描
+    # e["hh"]/e["ll"] 求均值，网格 6x4x3 时同一信号被扫描 72 遍。
+    pre = []
+    for e in events:
+        fwd = e.get("fwd", {})
+        row = {
+            "score": e.get("score", 0.0),
+            "dist": e.get("dist", float("inf")),
+            "fwd": fwd,
+            "mfe": {k: _mfe(e, k) for k in fwd_days},
+            "mae": {k: _mae(e, k) for k in fwd_days},
+        }
+        pre.append(row)
     for s in min_score_grid:
         for dst in dist_grid:
             cols = []
             for k in fwd_days:
-                pool = [
-                    e
-                    for e in events
-                    if e["score"] >= s
-                    and e["dist"] <= dst
-                    and e["fwd"].get(k) is not None
-                ]
-                if pool:
-                    rets = [e["fwd"][k] for e in pool]
+                rets, mfes, maes = [], [], []
+                for e in pre:
+                    if e["score"] >= s and e["dist"] <= dst:
+                        r = e["fwd"].get(k)
+                        if r is not None:
+                            rets.append(r)
+                            mfes.append(e["mfe"][k])
+                            maes.append(e["mae"][k])
+                if rets:
                     wins = [r for r in rets if r > 0]
                     losses = [r for r in rets if r <= 0]
-                    mfe = mean(_mfe(e, k) for e in pool)
-                    mae = mean(_mae(e, k) for e in pool)
                     cols.append(
-                        f"{k:<4}  {len(pool):<4} {mean(rets):6.2f} "
-                        f"{len(wins)/len(pool)*100:5.1f} {_pf(wins, losses):5.2f} "
-                        f"{mfe:6.2f} {mae:6.2f}"
+                        f"{k:<4}  {len(rets):<4} {mean(rets):6.2f} "
+                        f"{len(wins)/len(rets)*100:5.1f} {_pf(wins, losses):5.2f} "
+                        f"{mean(mfes):6.2f} {mean(maes):6.2f}"
                     )
                 else:
                     cols.append(f"{k:<4}     0     -    -    -    -    -")

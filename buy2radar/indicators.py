@@ -17,6 +17,16 @@ from __future__ import annotations
 from .model import Candle
 from .util import safe_div
 
+_BAR_RE = None
+try:
+    import re as _re
+
+    _BAR_RE = _re.compile(r"^(\d+)(m|H|D|W|M)")
+except ImportError:  # pragma: no cover
+    _BAR_RE = None
+
+_BAR_MINUTES_CACHE: dict[str, int] = {}
+
 
 def indicator_warmup(
     macd_slow: int = 26, macd_signal: int = 9, atr_period: int = 14
@@ -95,12 +105,17 @@ _BAR_MINUTES = {"m": 1, "H": 60, "D": 24 * 60, "W": 7 * 24 * 60, "M": 30 * 24 * 
 
 def bar_minutes(bar: str) -> int:
     """OKX bar（如 15m/1H/4H/1Dutc/1W）→ 单根K分钟数。未知格式按日线兜底。"""
-    import re
-
-    m = re.match(r"^(\d+)(m|H|D|W|M)", (bar or "").strip())
+    key = (bar or "").strip()
+    hit = _BAR_MINUTES_CACHE.get(key)
+    if hit is not None:
+        return hit
+    m = _BAR_RE.match(key) if _BAR_RE is not None else None
     if not m:
+        _BAR_MINUTES_CACHE[key] = 24 * 60
         return 24 * 60
-    return max(1, int(m.group(1)) * _BAR_MINUTES[m.group(2)])
+    val = max(1, int(m.group(1)) * _BAR_MINUTES[m.group(2)])
+    _BAR_MINUTES_CACHE[key] = val
+    return val
 
 
 def turnover_24h_at(

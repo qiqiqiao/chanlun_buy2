@@ -73,6 +73,25 @@ class Store:
             row = cur.fetchone()
             return row["m"] if row and row["m"] else 0
 
+    def latest_map(self, inst_ids: list[str], bar: str) -> dict[str, int]:
+        """一次查询多币最新 ts，避免 sync 前 500 次顺序往返。"""
+        if not inst_ids:
+            return {}
+        with self._lock:
+            out: dict[str, int] = {i: 0 for i in inst_ids}
+            chunk = 200
+            for i in range(0, len(inst_ids), chunk):
+                part = inst_ids[i : i + chunk]
+                q = (
+                    "SELECT inst_id, MAX(ts) AS m FROM candles "
+                    "WHERE bar=? AND inst_id IN (%s) GROUP BY inst_id"
+                    % ",".join("?" * len(part))
+                )
+                for row in self.conn.execute(q, [bar, *part]):
+                    if row["m"]:
+                        out[row["inst_id"]] = row["m"]
+            return out
+
     def load_candles(
         self, inst_id: str, bar: str, limit: int, closed_before_ms: int | None = None
     ) -> list[Candle]:
@@ -163,29 +182,53 @@ class Store:
         sync_all 全批（500币）只产生一次提交；线程池内只做网络拉取不碰 DB。
         """
         with self._lock:
-            for inst_id, rows in (candles_map or {}).items():
-                if rows:
-                    self.conn.executemany(
-                        "INSERT OR IGNORE INTO candles(inst_id,bar,ts,o,h,l,c,vol,vol_ccy) "
-                        "VALUES(?,?,?,?,?,?,?,?,?)",
-                        [(inst_id, bar, *r) for r in rows],
-                    )
-            for inst_id, info in instruments or []:
-                self.conn.execute(
+            before = self.conn.total_changes
+            if candles_map:
+                self.conn.executemany(
+                    "INSERT OR IGNORE INTO candles(inst_id,bar,ts,o,h,l,c,vol,vol_ccy) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    [
+                        (inst_id, bar, *r)
+                        for inst_id, rows in (candles_map or {}).items()
+                        for r in rows
+                        if r
+                    ],
+                )
+            inserted = self.conn.total_changes - before
+            if instruments:
+                self.conn.executemany(
                     "INSERT OR REPLACE INTO instruments(inst_id,inst_type,base,quote,"
                     "last_px,turnover24h,ts) VALUES(?,?,?,?,?,?,?)",
-                    (
-                        inst_id,
-                        info.get("inst_type"),
-                        info.get("base"),
-                        info.get("quote"),
-                        info.get("last_px", 0.0),
-                        info.get("turnover24h", 0.0),
-                        info.get("ts", 0),
-                    ),
+                    [
+                        (
+                            inst_id,
+                            info.get("inst_type"),
+                            info.get("base"),
+                            info.get("quote"),
+                            info.get("last_px", 0.0),
+                            info.get("turnover24h", 0.0),
+                            info.get("ts", 0),
+                        )
+                        for inst_id, info in instruments
+                    ],
                 )
-            if keep > 0:
-                for inst_id in candles_map or {}:
+            if keep > 0 and candles_map and inserted > 0:
+                # 按需裁剪：零新行时直接跳过（稳态同步多为重复 upsert）；
+                # 否则先 GROUP BY 找出真正超限的币，只对它们 DELETE。
+                # 原实现对 500 个币无条件逐个 DELETE...NOT IN，即使 count<=keep。
+                ids = list(candles_map)
+                over: set[str] = set()
+                for i in range(0, len(ids), 200):
+                    part = ids[i : i + 200]
+                    q = (
+                        "SELECT inst_id, COUNT(*) AS n FROM candles "
+                        "WHERE bar=? AND inst_id IN (%s) GROUP BY inst_id"
+                        % ",".join("?" * len(part))
+                    )
+                    for row in self.conn.execute(q, [bar, *part]):
+                        if row["n"] > keep:
+                            over.add(row["inst_id"])
+                for inst_id in over:
                     self.conn.execute(
                         "DELETE FROM candles WHERE inst_id=? AND bar=? AND ts NOT IN "
                         "(SELECT ts FROM candles WHERE inst_id=? AND bar=? "
@@ -212,15 +255,17 @@ class Store:
         return {r["inst_id"]: dict(r) for r in rows}
 
     def save_pool(self, rows: list[dict]) -> None:
+        if not rows:
+            return
         with self._lock:
-            for r in rows:
-                self.conn.execute(
-                    "INSERT INTO pool_state(inst_id,is_member,in_top,entered_ms,"
-                    "removed_ms,last_score,last_final,ts) VALUES(?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(inst_id) DO UPDATE SET is_member=excluded.is_member,"
-                    "in_top=excluded.in_top,entered_ms=excluded.entered_ms,"
-                    "removed_ms=excluded.removed_ms,last_score=excluded.last_score,"
-                    "last_final=excluded.last_final,ts=excluded.ts",
+            self.conn.executemany(
+                "INSERT INTO pool_state(inst_id,is_member,in_top,entered_ms,"
+                "removed_ms,last_score,last_final,ts) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(inst_id) DO UPDATE SET is_member=excluded.is_member,"
+                "in_top=excluded.in_top,entered_ms=excluded.entered_ms,"
+                "removed_ms=excluded.removed_ms,last_score=excluded.last_score,"
+                "last_final=excluded.last_final,ts=excluded.ts",
+                [
                     (
                         r["inst_id"],
                         1 if r.get("is_member") else 0,
@@ -230,8 +275,10 @@ class Store:
                         r.get("last_score", 0.0),
                         r.get("last_final", 0.0),
                         r.get("ts", 0),
-                    ),
-                )
+                    )
+                    for r in rows
+                ],
+            )
             self.conn.commit()
 
     def log_scan(self, scan_id: str, kind: str, payload: list[dict]) -> None:
